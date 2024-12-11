@@ -1,9 +1,12 @@
 import math
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
 import torch.nn.functional as F
 from utils import ShiftWindowMSA
 from mmengine.model import BaseModule
+from base_backbone import BaseBackbone
+from mmengine.utils.dl_utils.parrots_wrapper import _BatchNorm
 from mmcv.cnn.bricks.transformer import PatchMerging, PatchEmbed, FFN
     
 class DropPath(nn.Module):
@@ -75,16 +78,16 @@ class SwinTransformerBlock(BaseModule):
         return x
 
 
-class BasicLayer(nn.Module):
+class BasicLayer(BaseModule):
     """ Basic Layer """
-    def __init__(self, dim, depth, num_heads, window_size, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
-                 norm_layer=nn.LayerNorm, downsample=None):
+    def __init__(self, dim, depth, num_heads, window_size, mlp_ratio=4., drop_path=0.,
+                 norm_layer=nn.LayerNorm, downsample=PatchMerging):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.window_size = window_size
         self.shift_size = window_size // 2
-        self.blocks = nn.ModuleList([])
+        self.blocks = nn.ModuleList()
         for i in range(depth):
             _block_cfgs = {
                 'embed_dims': dim,
@@ -97,65 +100,44 @@ class BasicLayer(nn.Module):
             }
             block = SwinTransformerBlock(**_block_cfgs)
             self.blocks.append(block)
-        self.blocks = nn.ModuleList([
-            SwinTransformerBlock(
-                dim=dim, num_heads=num_heads, window_size=window_size, shift_size=0 if (i % 2 == 0) else self.shift_size,
-                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop, attn_drop=attn_drop, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer)
-            for i in range(depth)
-        ])
         if downsample is not None:
-            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
+            self.downsample = downsample(in_channels=dim, out_channels=dim * 2, norm_cfg='LN')
         else:
             self.downsample = None
 
-    def create_mask(self, x, H, W):
-        # Create attention mask
-        B, L, C = x.shape
-        img_mask = torch.zeros((B, H, W), dtype=torch.bool).to(x.device)  # Init mask
-        h_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        w_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-
-        cnt = 0
-        for h in h_slices:
-            for w in w_slices:
-                img_mask[:, cnt:cnt + self.window_size, cnt:cnt + self.window_size] = True
-                cnt += self.window_size
-
-        mask_windows = window_partition(img_mask, self.window_size)
-        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float('-inf')).masked_fill(attn_mask == 0, 0)
-        return attn_mask
-
-    def forward(self, x, H, W):
-        attn_mask = self.create_mask(x, H, W)
+    def forward(self, x, in_shape):
         for blk in self.blocks:
-            blk.H, blk.W = H, W
-            x = blk(x, attn_mask)
+            x = blk(x, in_shape)
         if self.downsample is not None:
-            x = self.downsample(x, H, W)
-            H, W = (H + 1) // 2, (W + 1) // 2
-        return x, H, W
+            x, in_shape = self.downsample(x, in_shape)
+            #H, W = (H + 1) // 2, (W + 1) // 2
+        return x, in_shape
+    
+    @property
+    def out_channels(self):
+        if self.downsample:
+            return self.downsample.out_channels
+        else:
+            return self.dim
 
-class SwinTransformer(nn.Module):
+class SwinTransformer(BaseBackbone):
     """ Swin Transformer """
-    def __init__(self, patch_size=4, in_chans=3, num_classes=1000, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
-                 window_size=7, mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm,
-                 patch_norm=True, frozen_stages=-1):
+    def __init__(self, patch_size=4, in_chans=3, num_classes=4, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
+                 window_size=7, mlp_ratio=4., drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm,
+                 patch_norm=True, frozen_stages=-1, out_indices=[0, 1, 2, 3], norm_eval=False):
         super().__init__()
         self.frozen_stages = frozen_stages
+        self.norm_eval = norm_eval
         self.num_classes = num_classes
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.patch_norm = patch_norm
+        self.out_indices = out_indices
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
-        self.patch_embed = PatchEmbed(patch_size=patch_size, in_channels=in_chans, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        embed_dims = [embed_dim]
+        self.patch_embed = PatchEmbed(kernel_size=patch_size, in_channels=in_chans, embed_dims=embed_dim,
+                                      conv_type='Conv2d', norm_cfg=dict(type='LN'))
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         self.layers = nn.ModuleList()
@@ -163,14 +145,20 @@ class SwinTransformer(nn.Module):
             layers = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
                                 depth=depths[i_layer],
                                 num_heads=num_heads[i_layer],
-                                window_size=window_size, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
-                                drop=drop_rate, attn_drop=attn_drop_rate,
+                                window_size=window_size, mlp_ratio=mlp_ratio,
                                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                 norm_layer=norm_layer, downsample=PatchMerging if (i_layer < self.num_layers - 1) else None)
             self.layers.append(layers)
+            embed_dims.append(layers.out_channels)
         self.norm = norm_layer(self.num_features)
-        self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.norm_list = nn.ModuleList()
+        self.num_features = embed_dims[:-1]
+        for i in out_indices:
+            norm = norm_layer(self.num_features[i])
+            self.norm_list.append(norm)
+
+        #self.avgpool = nn.AdaptiveAvgPool1d(1)
+        #self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -182,15 +170,24 @@ class SwinTransformer(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        x, H, W = self.patch_embed(x)
+        x, hw_shape = self.patch_embed(x)
         x = self.pos_drop(x)
-        for layer in self.layers:
-            x, H, W = layer(x, H, W)
-        x = self.norm(x)
-        x = self.avgpool(x.transpose(1, 2))
-        x = torch.flatten(x, 1)
-        x = self.head(x)
-        return x
+        outs = []
+        for i, layer in enumerate(self.layers):
+            x, hw_shape = layer(x, hw_shape)
+            if i in self.out_indices:
+                out = self.norm_list[i](x)
+                out = out.view(-1, *hw_shape,
+                               self.num_features[i]).permute(0, 3, 1,
+                                                             2).contiguous()
+                outs.append(out)
+            if layer.downsample is not None:
+                x, hw_shape = layer.downsample(x, hw_shape)
+        #x = self.norm(x)
+        #x = self.avgpool(x.transpose(1, 2))
+        #x = torch.flatten(x, 1)
+        #x = self.head(x)
+        return tuple(outs)
     
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
@@ -199,7 +196,7 @@ class SwinTransformer(nn.Module):
                 param.requires_grad = False
 
         for i in range(0, self.frozen_stages + 1):
-            m = self.stages[i]
+            m = self.layers[i]
             m.eval()
             for param in m.parameters():
                 param.requires_grad = False
