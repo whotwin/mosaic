@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+from typing import Sequence
 import pytorch_lightning as pl
 import torch.nn.functional as F
 from utils import ShiftWindowMSA
@@ -58,7 +59,7 @@ class SwinTransformerBlock(BaseModule):
             **attn_cfgs
         }
         self.attn = ShiftWindowMSA(**_attn_cfgs)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        #self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(embed_dims)
 
     def forward(self, x, hw_shape):
@@ -83,6 +84,8 @@ class BasicLayer(BaseModule):
     def __init__(self, dim, depth, num_heads, window_size, mlp_ratio=4., drop_path=0.,
                  norm_layer=nn.LayerNorm, downsample=PatchMerging):
         super().__init__()
+        if not isinstance(drop_path, Sequence):
+            drop_path = [drop_path] * depth
         self.dim = dim
         self.depth = depth
         self.window_size = window_size
@@ -95,13 +98,13 @@ class BasicLayer(BaseModule):
                 'window_size': window_size,
                 'shift_size': self.shift_size if i % 2 != 0 else 0,
                 'ffn_ratio': mlp_ratio,
-                'drop_path': drop_path,
+                'drop_path': drop_path[i],
 
             }
             block = SwinTransformerBlock(**_block_cfgs)
             self.blocks.append(block)
         if downsample is not None:
-            self.downsample = downsample(in_channels=dim, out_channels=dim * 2, norm_cfg='LN')
+            self.downsample = downsample(in_channels=dim, out_channels=dim * 2, norm_cfg=dict(type='LN'))
         else:
             self.downsample = None
 
@@ -140,19 +143,20 @@ class SwinTransformer(BaseBackbone):
                                       conv_type='Conv2d', norm_cfg=dict(type='LN'))
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        self.layers = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            layers = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                                depth=depths[i_layer],
-                                num_heads=num_heads[i_layer],
+        self.stages = nn.ModuleList()
+        for i_layer, (depth, num_head) in enumerate(zip(depths, num_heads)):
+            stages = BasicLayer(dim=embed_dims[-1],
+                                depth=depth,
+                                num_heads=num_head,
                                 window_size=window_size, mlp_ratio=mlp_ratio,
-                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                                drop_path=dpr[:depth],
                                 norm_layer=norm_layer, downsample=PatchMerging if (i_layer < self.num_layers - 1) else None)
-            self.layers.append(layers)
-            embed_dims.append(layers.out_channels)
+            self.stages.append(stages)
+            dpr = dpr[depth:]
+            embed_dims.append(stages.out_channels)
         self.norm = norm_layer(self.num_features)
         self.norm_list = nn.ModuleList()
-        self.num_features = embed_dims[:-1]
+        self.num_features = embed_dims[1:]
         for i in out_indices:
             norm = norm_layer(self.num_features[i])
             self.norm_list.append(norm)
@@ -173,7 +177,7 @@ class SwinTransformer(BaseBackbone):
         x, hw_shape = self.patch_embed(x)
         x = self.pos_drop(x)
         outs = []
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(self.stages):
             x, hw_shape = layer(x, hw_shape)
             if i in self.out_indices:
                 out = self.norm_list[i](x)
@@ -213,3 +217,17 @@ class SwinTransformer(BaseBackbone):
                 # trick: eval have effect on BatchNorm only
                 if isinstance(m, _BatchNorm):
                     m.eval()
+
+if __name__ == '__main__':
+    data = torch.randn((1, 1, 224, 224))
+    backbone = SwinTransformer(in_chans=1)
+    out = backbone(data)
+    drop_path_rate = 0.1
+    depths = [2, 2, 6, 2]
+    dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+    for i_layer in range(len(depths)):
+        depth = depths[i_layer]
+        print(dpr[:depth])
+        dpr = dpr[depth:]
+        print(dpr, len(dpr))
+    #print(dpr, len(dpr))
