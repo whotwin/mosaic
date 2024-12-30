@@ -5,11 +5,24 @@ from typing import Sequence
 import pytorch_lightning as pl
 import torch.nn.functional as F
 from utils import ShiftWindowMSA
+from cnn_encoder import CNN_Encoder
 from mmengine.model import BaseModule
 from base_backbone import BaseBackbone
 from mmengine.utils.dl_utils.parrots_wrapper import _BatchNorm
-from mmcv.cnn.bricks.transformer import PatchMerging, PatchEmbed, FFN
+from mmcv.cnn.bricks.transformer import PatchMerging, FFN#PatchEmbed, FFN
+
+class PatchEmbed(nn.Module):
+    def __init__(self, in_channels, embed_dims, kernel_size):
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.conv = nn.Conv2d(in_channels, embed_dims, kernel_size, kernel_size, padding=kernel_size // 2 - 1)
+        self.norm = nn.LayerNorm(embed_dims)
+        self.patch_size = kernel_size
     
+    def forward(self, x):
+        B, C, H, W = x.size()
+        return self.norm(self.conv(x).view(B, self.embed_dims, -1).transpose(1, 2)), (H // self.patch_size, W // self.patch_size)
+
 class DropPath(nn.Module):
     """ Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
     """
@@ -125,10 +138,11 @@ class BasicLayer(BaseModule):
 
 class SwinTransformer(BaseBackbone):
     """ Swin Transformer """
-    def __init__(self, patch_size=4, in_chans=3, num_classes=4, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
+    def __init__(self, patch_size=2, in_chans=3, num_classes=4, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
                  window_size=7, mlp_ratio=4., drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm,
                  patch_norm=True, frozen_stages=-1, out_indices=[0, 1, 2, 3], norm_eval=False):
         super().__init__()
+        self.pre_conv = CNN_Encoder(in_channels=embed_dim, embed_dims=2 * embed_dim, kernel_size=3)
         self.frozen_stages = frozen_stages
         self.norm_eval = norm_eval
         self.num_classes = num_classes
@@ -139,8 +153,7 @@ class SwinTransformer(BaseBackbone):
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
         embed_dims = [embed_dim]
-        self.patch_embed = PatchEmbed(kernel_size=patch_size, in_channels=in_chans, embed_dims=embed_dim,
-                                      conv_type='Conv2d', norm_cfg=dict(type='LN'))
+        self.patch_embed = PatchEmbed(kernel_size=patch_size, in_channels=in_chans, embed_dims=embed_dim)#)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         self.stages = nn.ModuleList()
@@ -150,7 +163,7 @@ class SwinTransformer(BaseBackbone):
                                 num_heads=num_head,
                                 window_size=window_size, mlp_ratio=mlp_ratio,
                                 drop_path=dpr[:depth],
-                                norm_layer=norm_layer, downsample=PatchMerging if (i_layer < self.num_layers - 1) else None)
+                                norm_layer=norm_layer, downsample=PatchMerging if (i_layer < self.num_layers) else None)#原来要减1
             self.stages.append(stages)
             dpr = dpr[depth:]
             embed_dims.append(stages.out_channels)
@@ -174,10 +187,18 @@ class SwinTransformer(BaseBackbone):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
+        B = x.size(0)
         x, hw_shape = self.patch_embed(x)
         x = self.pos_drop(x)
+        x = x.view(B, hw_shape[0], hw_shape[1], -1).permute(0, 3, 1, 2)
         outs = []
         for i, layer in enumerate(self.stages):
+            if i == 0:
+                x = self.pre_conv(x)
+                hw_shape = tuple(x.shape[-2:])
+                outs.append(x)
+                x = x.view(B, -1, hw_shape[0] * hw_shape[1]).transpose(1, 2)
+                continue
             x, hw_shape = layer(x, hw_shape)
             if i in self.out_indices:
                 out = self.norm_list[i](x)
@@ -185,8 +206,8 @@ class SwinTransformer(BaseBackbone):
                                self.num_features[i]).permute(0, 3, 1,
                                                              2).contiguous()
                 outs.append(out)
-            if layer.downsample is not None:
-                x, hw_shape = layer.downsample(x, hw_shape)
+            '''if layer.downsample is not None:
+                x, hw_shape = layer.downsample(x, hw_shape)'''
         #x = self.norm(x)
         #x = self.avgpool(x.transpose(1, 2))
         #x = torch.flatten(x, 1)
@@ -219,8 +240,8 @@ class SwinTransformer(BaseBackbone):
                     m.eval()
 
 if __name__ == '__main__':
-    data = torch.randn((1, 1, 224, 224))
-    backbone = SwinTransformer(in_chans=1)
+    data = torch.randn((1, 1, 224, 224)).cuda()
+    backbone = SwinTransformer(in_chans=1).cuda()
     out = backbone(data)
     drop_path_rate = 0.1
     depths = [2, 2, 6, 2]
