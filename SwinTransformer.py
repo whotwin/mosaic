@@ -6,6 +6,7 @@ import pytorch_lightning as pl
 import torch.nn.functional as F
 from utils import ShiftWindowMSA
 from cnn_encoder import CNN_Encoder
+from cnn_decoder import CNN_Decoder
 from mmengine.model import BaseModule
 from base_backbone import BaseBackbone
 from mmengine.utils.dl_utils.parrots_wrapper import _BatchNorm
@@ -135,6 +136,56 @@ class BasicLayer(BaseModule):
             return self.downsample.out_channels
         else:
             return self.dim
+        
+class BasicLayer_Upsample(BaseModule):
+    """ Basic Layer """
+    def __init__(self, dim, depth, num_heads, window_size, mlp_ratio=4., drop_path=0.,
+                 norm_layer=nn.LayerNorm, upsample=True):
+        super().__init__()
+        if not isinstance(drop_path, Sequence):
+            drop_path = [drop_path] * depth
+        self.dim = dim
+        self.depth = depth
+        self.window_size = window_size
+        self.shift_size = window_size // 2
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            _block_cfgs = {
+                'embed_dims': dim,
+                'num_heads': num_heads,
+                'window_size': window_size,
+                'shift_size': self.shift_size if i % 2 != 0 else 0,
+                'ffn_ratio': mlp_ratio,
+                'drop_path': drop_path[i],
+
+            }
+            block = SwinTransformerBlock(**_block_cfgs)
+            self.blocks.append(block)
+        if upsample:
+            #self.downsample = downsample(in_channels=dim, out_channels=dim * 2, norm_cfg=dict(type='LN'))
+            self.upsample = nn.Sequential(
+                nn.ConvTranspose2d(in_channels=dim, out_channels=dim // 2, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.BatchNorm2d(dim // 2),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.upsample = None
+
+    def forward(self, x, in_shape):
+        for blk in self.blocks:
+            x = blk(x, in_shape)
+        if self.upsample is not None:
+            x = self.upsample(x.transpose(2, 1).view(-1, self.dim, in_shape[0], in_shape[1])).view(-1, self.dim // 2, in_shape[0]*in_shape[1]*4).transpose(2, 1)
+            in_shape = (in_shape[0] * 2, in_shape[1] * 2)
+            #H, W = (H + 1) // 2, (W + 1) // 2
+        return x, in_shape
+    
+    @property
+    def out_channels(self):
+        if self.upsample:
+            return self.upsample[0].out_channels
+        else:
+            return self.dim
 
 class SwinTransformer(BaseBackbone):
     """ Swin Transformer """
@@ -143,6 +194,7 @@ class SwinTransformer(BaseBackbone):
                  patch_norm=True, frozen_stages=-1, out_indices=[0, 1, 2, 3], norm_eval=False):
         super().__init__()
         self.pre_conv = CNN_Encoder(in_channels=embed_dim, embed_dims=2 * embed_dim, kernel_size=3)
+        self.post_conv = CNN_Decoder(in_channels=embed_dim * 2, embed_dims=embed_dim, kernel_size=3)
         self.frozen_stages = frozen_stages
         self.norm_eval = norm_eval
         self.num_classes = num_classes
@@ -173,7 +225,22 @@ class SwinTransformer(BaseBackbone):
         for i in out_indices:
             norm = norm_layer(self.num_features[i])
             self.norm_list.append(norm)
-
+        reversed_depths = depths[::-1]
+        reversed_num_heads = num_heads[::-1]
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(reversed_depths))]
+        self.up_stages = nn.ModuleList()
+        embed_dims = [embed_dims[-1]]
+        for i_layer, (depth, num_head) in enumerate(zip(reversed_depths, reversed_num_heads)):
+            stages = BasicLayer_Upsample(dim=embed_dims[-1],
+                                depth=depth,
+                                num_heads=num_head,
+                                window_size=window_size, mlp_ratio=mlp_ratio,
+                                drop_path=dpr[:depth],
+                                norm_layer=norm_layer, upsample=True if (i_layer < self.num_layers) else None)#原来要减1
+            self.up_stages.append(stages)
+            dpr = dpr[depth:]
+            embed_dims.append(stages.out_channels)
+        self.proj = nn.Conv2d(embed_dim, num_classes, 1)
         #self.avgpool = nn.AdaptiveAvgPool1d(1)
         #self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
@@ -186,7 +253,7 @@ class SwinTransformer(BaseBackbone):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x):
+    def forward_enc(self, x):
         B = x.size(0)
         x, hw_shape = self.patch_embed(x)
         x = self.pos_drop(x)
@@ -213,6 +280,29 @@ class SwinTransformer(BaseBackbone):
         #x = torch.flatten(x, 1)
         #x = self.head(x)
         return tuple(outs)
+    
+    def forward_dec(self, encs):
+        outs = []
+        for i, layer in enumerate(self.up_stages):
+            if i == len(self.up_stages) - 1:
+                B, N, D = x.size()
+                x = self.post_conv(encs[0] + x.transpose(2, 1).view(B, D, hw_shape[0], hw_shape[1]))
+            else:
+                if i == 0:
+                    B, C, H, W = encs[-(i + 1)].size()
+                    x, hw_shape = layer(encs[-1].view(B, C, H*W).transpose(2, 1), (H, W))     
+                else:
+                    B, N, D = x.size()
+                    x, hw_shape = layer(encs[-(i + 1)].view(B, D, -1).transpose(2, 1) + x, hw_shape)
+        return x
+
+    def forward(self, x):
+        x = x.float()
+        encs = self.forward_enc(x)
+        out = self.forward_dec(encs)
+        out = self.proj(out)
+        return out
+
     
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
